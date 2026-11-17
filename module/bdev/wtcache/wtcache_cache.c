@@ -30,7 +30,6 @@
 #define wtc_cpu_relax() do { } while (0)
 #endif
 
-#define DEBUG
 #ifdef DEBUG
 #define WTC_STAT_ADD(field, n) __atomic_fetch_add(&(field), (n), __ATOMIC_RELAXED)
 #else
