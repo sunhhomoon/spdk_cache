@@ -78,6 +78,7 @@ typedef void (*ublk_get_buf_cb)(struct ublk_io *io);
 
 struct ublk_io {
 	void			*payload;
+	struct iovec		fua_iov;
 	void			*mpool_entry;
 	bool			need_data;
 	bool			user_copy;
@@ -1251,7 +1252,20 @@ _ublk_submit_bdev_io(struct ublk_queue *q, struct ublk_io *io)
 		rc = spdk_bdev_read_blocks(desc, ch, io->payload, offset_blocks, num_blocks, read_cb, io);
 		break;
 	case UBLK_IO_OP_WRITE:
-		rc = spdk_bdev_write_blocks(desc, ch, io->payload, offset_blocks, num_blocks, ublk_io_done, io);
+		if (iod->op_flags & UBLK_IO_F_FUA) {
+			/* 커널이 보낸 FUA를 NVMe와 같은 방식(CDW12의 FUA 비트)으로 bdev에 전달 */
+			struct spdk_bdev_ext_io_opts opts = {
+				.size = SPDK_SIZEOF(&opts, nvme_cdw13),
+				.nvme_cdw12.raw = SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS,
+			};
+
+			io->fua_iov.iov_base = io->payload;
+			io->fua_iov.iov_len = num_blocks * spdk_bdev_get_block_size(ublk->bdev);
+			rc = spdk_bdev_writev_blocks_ext(desc, ch, &io->fua_iov, 1, offset_blocks, num_blocks,
+							 ublk_io_done, io, &opts);
+		} else {
+			rc = spdk_bdev_write_blocks(desc, ch, io->payload, offset_blocks, num_blocks, ublk_io_done, io);
+		}
 		break;
 	case UBLK_IO_OP_FLUSH:
 		rc = spdk_bdev_flush_blocks(desc, ch, 0, spdk_bdev_get_num_blocks(ublk->bdev), ublk_io_done, io);
@@ -1722,7 +1736,8 @@ ublk_info_param_init(struct spdk_ublk_dev *ublk)
 	};
 
 	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_FLUSH)) {
-		uparams.basic.attrs = UBLK_ATTR_VOLATILE_CACHE;
+		/* FUA도 지원한다고 알려야 커널이 FUA 쓰기를 "쓰기 + Flush"로 쪼개지 않고 그대로 보낸다 */
+		uparams.basic.attrs = UBLK_ATTR_VOLATILE_CACHE | UBLK_ATTR_FUA;
 	}
 
 	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {

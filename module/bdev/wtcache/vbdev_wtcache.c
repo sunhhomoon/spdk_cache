@@ -678,6 +678,16 @@ vbdev_wtcache_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 		rc = wtc_write(pt_node->cache, bdev_io->u.bdev.offset_blocks,
 			       bdev_io->u.bdev.num_blocks,
 			       bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt);
+		if (rc == 0 && (bdev_io->u.bdev.nvme_cdw12.raw & SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)) {
+			io_ctx->failed = false;
+			io_ctx->flush_mark = wtc_flush_mark(pt_node->cache);
+			if (pt_node->wb_thread == NULL ||
+			    spdk_thread_send_msg(pt_node->wb_thread, wtcache_wb_add_flush, io_ctx) != 0) {
+				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			}
+			wtcache_kick_writeback(pt_node);
+			return;
+		}
 		if (rc == 0) {
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 		} else if (rc == -ENOMEM) {
