@@ -679,6 +679,25 @@ def add_parser(subparsers):
     p.add_argument('name', help='Pass through bdev name')
     p.set_defaults(func=bdev_passthru_delete)
 
+    def bdev_wtcache_create(args):
+        print_json(args.client.bdev_wtcache_create(
+                                                base_bdev_name=args.base_bdev_name,
+                                                name=args.name,
+                                                uuid=args.uuid))
+
+    p = subparsers.add_parser('bdev_wtcache_create', help="Create write cache bdev.")
+    p.add_argument('-b', '--base-bdev-name', help='Name of the base bdev', required=True)
+    p.add_argument('-p', '--name', help="Name of the cache bdev", required=True)
+    p.add_argument('-u', '--uuid', help="UUID of the bdev")
+    p.set_defaults(func=bdev_wtcache_create)
+
+    def bdev_wtcache_delete(args):
+        args.client.bdev_wtcache_delete(name=args.name)
+
+    p = subparsers.add_parser('bdev_wtcache_delete', help='Delete write cache bdev.')
+    p.add_argument('name', help='Cache bdev name')
+    p.set_defaults(func=bdev_wtcache_delete)
+
     def bdev_get_bdevs(args):
         print_dict(args.client.bdev_get_bdevs(name=args.name, timeout=args.timeout))
 

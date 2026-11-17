@@ -2921,6 +2921,36 @@ methods:
         type: string
         required: true
         description: Pass through bdev name
+  - name: bdev_wtcache_create
+    private: true
+    description: |
+      Create write cache bdev.
+    result:
+      type: string
+      description: Name of newly created bdev.
+    params:
+      - name: name
+        type: string
+        required: true
+        description: Name of the write cache bdev
+      - name: base_bdev_name
+        type: string
+        required: true
+        description: Name of the base bdev
+      - name: uuid
+        type: uuid
+        description: UUID of the bdev
+  - name: bdev_wtcache_delete
+    private: true
+    description: Delete wtcache bdev.
+    result:
+      type: boolean
+      description: true on success
+    params:
+      - name: name
+        type: string
+        required: true
+        description: write cache bdev name
   - name: bdev_xnvme_create
     description: Create xnvme bdev. This bdev type redirects all IO to its underlying backend.
     result:
