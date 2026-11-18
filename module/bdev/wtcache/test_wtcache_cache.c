@@ -90,7 +90,8 @@ wb_thread(void *arg)
 	return NULL;
 }
 
-static long g_errors, g_nomem, g_flushes;
+static long g_errors, g_nomem, g_flushes, g_fua_fast, g_fua_slow;
+static int g_fua_pct = 20;
 
 static void *
 io_thread(void *arg)
@@ -117,9 +118,41 @@ io_thread(void *arg)
 			for (uint64_t i = 0; i < n; i++) {
 				fill(buf + i * BL, lba + i, ver);
 			}
-			while (wtc_write(g_c, lba, n, iov, 3) == -ENOMEM) {
-				__atomic_add_fetch(&g_nomem, 1, __ATOMIC_RELAXED);
-				usleep(100);	/* bdev 계층의 NOMEM 재시도 흉내 */
+			bool fua = (rand_r(&seed) % 100) < g_fua_pct;
+
+			if (fua && !wtc_range_dirty(g_c, lba, n)) {
+				/* FUA 빠른 경로: 디스크에 바로 쓰고 캐시에 clean으로 */
+				pthread_mutex_lock(&g_disk_lock);
+				memcpy(g_disk + lba * BL, buf, len);
+				pthread_mutex_unlock(&g_disk_lock);
+				wtc_insert_clean(g_c, lba, n, iov, 3);
+				__atomic_add_fetch(&g_fua_fast, 1, __ATOMIC_RELAXED);
+			} else {
+				while (wtc_write(g_c, lba, n, iov, 3) == -ENOMEM) {
+					__atomic_add_fetch(&g_nomem, 1, __ATOMIC_RELAXED);
+					usleep(100);	/* bdev 계층의 NOMEM 재시도 흉내 */
+				}
+				if (fua) {
+					/* FUA 느린 경로: 쓰기 + Flush */
+					uint64_t mark = wtc_flush_mark(g_c);
+					while (!wtc_flush_reached(g_c, mark)) {
+						usleep(50);
+					}
+					__atomic_add_fetch(&g_fua_slow, 1, __ATOMIC_RELAXED);
+				}
+			}
+			if (fua) {
+				/* FUA 완료 시점: 이 블록들은 디스크에 이 데이터가 있어야 한다 */
+				pthread_mutex_lock(&g_disk_lock);
+				for (uint64_t i = 0; i < n; i++) {
+					if (!check(g_disk + (lba + i) * BL, lba + i, ver)) {
+						if (__atomic_add_fetch(&g_errors, 1, __ATOMIC_RELAXED) < 5) {
+							fprintf(stderr, "FUA NOT DURABLE thr=%d lba=%lu\n", t,
+								(unsigned long)(lba + i));
+						}
+					}
+				}
+				pthread_mutex_unlock(&g_disk_lock);
 			}
 			for (uint64_t i = 0; i < n; i++) {
 				g_model[lba + i] = ver;
@@ -179,6 +212,9 @@ main(int argc, char **argv)
 	if (argc > 1) {
 		g_fail_pct = atoi(argv[1]);
 	}
+	if (argc > 2) {
+		g_fua_pct = atoi(argv[2]);
+	}
 	g_c = wtc_create(&o);
 	assert(g_c);
 
@@ -206,6 +242,7 @@ main(int argc, char **argv)
 	       g_fail_pct, st.read_hit_blocks, st.read_blocks, st.write_blocks, st.write_nomem,
 	       st.evictions, st.writebacks, st.wb_errors, st.wb_dropped, g_flushes, st.pending,
 	       st.used_bytes, st.total_bytes);
+	printf("fua_fast=%ld fua_slow=%ld\n", g_fua_fast, g_fua_slow);
 	printf("errors=%ld (dropped_flag=%d) -> %s\n", g_errors, dropped_err,
 	       g_errors == 0 ? "PASS" : (st.wb_dropped ? "MISMATCH (데이터 버림 발생, 예상된 결과)" : "FAIL"));
 	wtc_destroy(g_c);

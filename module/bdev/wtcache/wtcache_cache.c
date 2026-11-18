@@ -30,13 +30,6 @@
 #define wtc_cpu_relax() do { } while (0)
 #endif
 
-#ifdef DEBUG
-#define WTC_STAT_ADD(field, n) __atomic_fetch_add(&(field), (n), __ATOMIC_RELAXED)
-#else
-#define WTC_STAT_ADD(field, n) ((void)0)
-#endif
-#define WTC_STAT_GET(field) __atomic_load_n(&(field), __ATOMIC_RELAXED)
-
 typedef struct {
 	uint32_t v;
 } wtc_rwlock_t;
@@ -93,7 +86,8 @@ wtc_wr_unlock(wtc_rwlock_t *l)
 #define WTC_NIL			UINT32_MAX
 #define WTC_MAX_RETRIES		3
 #define WTC_DEFAULT_SHARDS	64
-#define WTC_DEFAULT_REGION	(64 * 1024)	/* bytes */
+//#define WTC_DEFAULT_REGION	(64 * 1024)	/* bytes */
+#define WTC_DEFAULT_REGION	(1024 * 1024)	/* bytes */
 #define WTC_WB_SCAN_MAX		128	/* wb_next 한 번에 샤드당 살펴볼 dirty extent 수 */
 
 enum wtc_state {
@@ -144,11 +138,9 @@ struct wtc_shard {
 	uint32_t		ndirty;		/* lock 없이 엿보기용 (atomic read) */
 
 	/* 통계: 쓰기 쪽은 배타 락 안에서, 읽기 쪽 두 개는 공유 락 아래라 relaxed atomic */
-#ifdef DEBUG
 	uint64_t		read_blocks, read_hit_blocks;
 	uint64_t		write_blocks, write_nomem;
 	uint64_t		evictions, writebacks, wb_errors, wb_dropped;
-#endif
 } __attribute__((aligned(64)));
 
 struct wtc_cache {
@@ -311,7 +303,7 @@ ext_evict(struct wtc_shard *s, struct wtc_extent *e)
 	ext_unmap(s, e);
 	TAILQ_REMOVE(&s->clean, e, link);
 	ext_free(s, e);
-        WTC_STAT_ADD(s->evictions, 1);
+	s->evictions++;
 }
 
 /* 블록 하나가 더 새로운 extent로 대체됨 */
@@ -506,7 +498,7 @@ write_piece(struct wtc_cache *c, uint64_t lba, uint64_t n,
 	}
 	if (s->nfree < need) {
 		/* 전부 dirty/inflight: writeback이 따라잡을 때까지 재시도 필요 */
-        	WTC_STAT_ADD(s->write_nomem, 1);
+		s->write_nomem++;
 		wtc_wr_unlock(&s->lock);
 		free(e);
 		return -ENOMEM;
@@ -545,7 +537,7 @@ write_piece(struct wtc_cache *c, uint64_t lba, uint64_t n,
 	e->seq = __atomic_add_fetch(&c->seq, 1, __ATOMIC_SEQ_CST);
 	TAILQ_INSERT_TAIL(&s->dirty, e, link);
 	__atomic_store_n(&s->ndirty, s->ndirty + 1, __ATOMIC_RELAXED);
-        WTC_STAT_ADD(s->write_blocks, n);
+	s->write_blocks += n;
 	__atomic_add_fetch(&c->pending, 1, __ATOMIC_RELAXED);
 
 	wtc_wr_unlock(&s->lock);
@@ -568,6 +560,121 @@ wtc_write(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
 		done += n;
 	}
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* FUA 쓰기 지원                                                        */
+/* ------------------------------------------------------------------ */
+
+bool
+wtc_range_dirty(struct wtc_cache *c, uint64_t lba, uint64_t nblocks)
+{
+	uint64_t done = 0;
+
+	while (done < nblocks) {
+		uint64_t cur = lba + done;
+		uint64_t pn = piece_len(c, cur, nblocks - done);
+		struct wtc_shard *s = shard_of(c, cur);
+		bool dirty = false;
+
+		wtc_rd_lock(&s->lock);
+		for (uint64_t b = 0; b < pn && !dirty; b++) {
+			struct wtc_extent *e = map_get(s, cur + b);
+
+			/* 인덱스는 블록의 최신 데이터를 가리킨다. 그게 clean이면 그보다 오래된
+			 * dirty는 이미 다 내려간 것이다 (겹치면 오래된 쪽이 먼저 내려가므로). */
+			dirty = (e != NULL && e->state != EXT_CLEAN);
+		}
+		wtc_rd_unlock(&s->lock);
+		if (dirty) {
+			return true;
+		}
+		done += pn;
+	}
+	return false;
+}
+
+static void
+clean_piece(struct wtc_cache *c, uint64_t lba, uint64_t n,
+	    const struct iovec *iovs, int iovcnt, size_t src_off)
+{
+	struct wtc_shard *s = shard_of(c, lba);
+	size_t bytes = n * c->blocklen;
+	uint32_t need = (uint32_t)((bytes + WTC_CHUNK_SIZE - 1) / WTC_CHUNK_SIZE);
+	struct wtc_extent *e, *victim, *old;
+
+	e = malloc(sizeof(*e) + need * sizeof(struct iovec));
+
+	wtc_wr_lock(&s->lock);
+	while (e != NULL && s->nfree < need && (victim = TAILQ_FIRST(&s->clean)) != NULL) {
+		ext_evict(s, victim);
+	}
+	if (e == NULL || s->nfree < need) {
+		/* 자리가 없으면 캐시에 넣지 않는다. 대신 이 범위의 옛 clean 데이터는 지워야
+		 * 이후 읽기가 SSD의 새 데이터를 본다. */
+		for (uint64_t b = 0; b < n; b++) {
+			old = map_get(s, lba + b);
+			if (old != NULL && old->state == EXT_CLEAN) {
+				map_del_if(s, lba + b, old);
+				ext_unref(s, old);
+			}
+		}
+		wtc_wr_unlock(&s->lock);
+		free(e);
+		return;
+	}
+	for (uint32_t i = 0; i < need; i++) {
+		size_t left = bytes - (size_t)i * WTC_CHUNK_SIZE;
+
+		e->iov[i].iov_base = s->base + (size_t)s->free_stack[--s->nfree] * WTC_CHUNK_SIZE;
+		e->iov[i].iov_len = left < WTC_CHUNK_SIZE ? left : WTC_CHUNK_SIZE;
+	}
+	wtc_wr_unlock(&s->lock);
+
+	/* 아직 아무도 모르는 청크이므로 락 없이 복사 */
+	e->io.lba = lba;
+	e->io.nblocks = n;
+	e->io.iovs = e->iov;
+	e->io.iovcnt = (int)need;
+	e->shard = s;
+	e->state = EXT_CLEAN;	/* SSD에 이미 있는 데이터 */
+	e->retries = 0;
+	e->live = 0;
+	iov_copy(e->iov, (int)need, 0, iovs, iovcnt, src_off, bytes);
+
+	wtc_wr_lock(&s->lock);
+	for (uint64_t b = 0; b < n; b++) {
+		old = map_get(s, lba + b);
+		if (old != NULL && old->state != EXT_CLEAN) {
+			/* 그 사이 같은 블록에 일반 쓰기가 들어와 dirty가 됐다: 그게 더 새롭다 */
+			continue;
+		}
+		old = map_set(s, lba + b, e);
+		if (old != NULL) {
+			ext_unref(s, old);
+		}
+		e->live++;
+	}
+	if (e->live == 0) {
+		ext_free(s, e);
+	} else {
+		TAILQ_INSERT_TAIL(&s->clean, e, link);
+	}
+	wtc_wr_unlock(&s->lock);
+}
+
+void
+wtc_insert_clean(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
+		 const struct iovec *iovs, int iovcnt)
+{
+	uint64_t done = 0;
+
+	while (done < nblocks) {
+		uint64_t n = piece_len(c, lba + done, nblocks - done);
+
+		clean_piece(c, lba + done, n, iovs, iovcnt, done * c->blocklen);
+		done += n;
+	}
 }
 
 static int
@@ -611,7 +718,7 @@ wtc_read(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
 				}
 				iov_copy(iovs, iovcnt, (done + j) * bl,
 					 e->iov, e->io.iovcnt, (cur + j - e->io.lba) * bl, (k - j) * bl);
-        			WTC_STAT_ADD(s->read_hit_blocks, k - j);
+				__atomic_fetch_add(&s->read_hit_blocks, k - j, __ATOMIC_RELAXED);
 			} else {
 				while (k < pn && map_get(s, cur + k) == NULL) {
 					k++;
@@ -624,7 +731,7 @@ wtc_read(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
 			}
 			j = k;
 		}
-        	WTC_STAT_ADD(s->read_blocks, pn);
+		__atomic_fetch_add(&s->read_blocks, pn, __ATOMIC_RELAXED);
 		wtc_rd_unlock(&s->lock);
 		done += pn;
 	}
@@ -697,7 +804,7 @@ wtc_wb_done(struct wtc_cache *c, struct wtc_wb_io *io, bool success)
 	wtc_wr_lock(&s->lock);
 	TAILQ_REMOVE(&s->inflight, e, link);
 	if (success) {
-        	WTC_STAT_ADD(s->writebacks, 1);
+		s->writebacks++;
 		if (e->live == 0) {
 			ext_free(s, e);		/* 이미 전부 새 데이터로 대체됨 */
 		} else {
@@ -707,15 +814,15 @@ wtc_wb_done(struct wtc_cache *c, struct wtc_wb_io *io, bool success)
 		__atomic_sub_fetch(&c->pending, 1, __ATOMIC_RELAXED);
 	} else if (++e->retries >= WTC_MAX_RETRIES) {
 		/* 포기: 캐시에서도 지우므로 이후 읽기는 장치의 옛 데이터를 본다 */
-        	WTC_STAT_ADD(s->wb_errors, 1);
-        	WTC_STAT_ADD(s->wb_dropped, 1);
+		s->wb_errors++;
+		s->wb_dropped++;
 		ext_unmap(s, e);
 		ext_free(s, e);
 		__atomic_store_n(&c->error, 1, __ATOMIC_SEQ_CST);
 		__atomic_sub_fetch(&c->pending, 1, __ATOMIC_RELAXED);
 	} else {
 		/* seq 순서 자리에 다시 넣어 재시도 */
-        	WTC_STAT_ADD(s->wb_errors, 1);
+		s->wb_errors++;
 		e->state = EXT_DIRTY;
 		dirty_insert_sorted(s, e);
 	}
@@ -787,20 +894,19 @@ wtc_get_stats(struct wtc_cache *c, struct wtc_stats *st)
 	memset(st, 0, sizeof(*st));
 	for (uint32_t i = 0; i < c->nshards; i++) {
 		struct wtc_shard *s = &c->shards[i];
-#ifdef DEBUG
-		st->read_blocks += WTC_STAT_GET(s->read_blocks);
-		st->read_hit_blocks += WTC_STAT_GET(s->read_hit_blocks);
-		st->write_blocks += WTC_STAT_GET(s->write_blocks);
-		st->write_nomem += WTC_STAT_GET(s->write_nomem);
-		st->evictions += WTC_STAT_GET(s->evictions);
-		st->writebacks += WTC_STAT_GET(s->writebacks);
-		st->wb_errors += WTC_STAT_GET(s->wb_errors);
-		st->wb_dropped += WTC_STAT_GET(s->wb_dropped);
-#endif
+
 		wtc_rd_lock(&s->lock);
+		st->read_blocks += __atomic_load_n(&s->read_blocks, __ATOMIC_RELAXED);
+		st->read_hit_blocks += __atomic_load_n(&s->read_hit_blocks, __ATOMIC_RELAXED);
+		st->write_blocks += s->write_blocks;
+		st->write_nomem += s->write_nomem;
+		st->evictions += s->evictions;
+		st->writebacks += s->writebacks;
+		st->wb_errors += s->wb_errors;
+		st->wb_dropped += s->wb_dropped;
 		st->used_bytes += (uint64_t)(s->nchunks - s->nfree) * WTC_CHUNK_SIZE;
-		wtc_rd_unlock(&s->lock);
 		st->total_bytes += (uint64_t)s->nchunks * WTC_CHUNK_SIZE;
+		wtc_rd_unlock(&s->lock);
 	}
 	st->pending = wtc_pending(c);
 }

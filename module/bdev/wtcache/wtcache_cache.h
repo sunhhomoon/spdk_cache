@@ -93,6 +93,17 @@ int wtc_write(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
 int wtc_read(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
 	     const struct iovec *iovs, int iovcnt, struct wtc_run *runs, int max_runs);
 
+/*
+ * FUA(바로 영속화) 쓰기용.
+ * wtc_range_dirty(): 범위 안에 아직 SSD에 안 내려간 캐시 데이터가 있으면 true.
+ *   false면 그 쓰기는 캐시를 거치지 않고 바로 SSD에 써도 순서 문제가 없다.
+ * wtc_insert_clean(): SSD 쓰기가 끝난 데이터를 clean으로 캐시에 넣는다 (읽기 히트용).
+ *   자리가 없으면 넣지 않고 그 범위의 옛 clean 데이터만 지운다.
+ */
+bool wtc_range_dirty(struct wtc_cache *c, uint64_t lba, uint64_t nblocks);
+void wtc_insert_clean(struct wtc_cache *c, uint64_t lba, uint64_t nblocks,
+		      const struct iovec *iovs, int iovcnt);
+
 /* writeback할 extent를 최대 max개 꺼낸다 (LBA가 겹치지 않는 것끼리는 동시에). 반환 개수 */
 int wtc_wb_next(struct wtc_cache *c, struct wtc_wb_io **out, int max);
 /* base 쓰기 완료 시 호출 */

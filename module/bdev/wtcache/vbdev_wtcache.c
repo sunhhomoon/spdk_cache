@@ -559,6 +559,96 @@ wtcache_read_runs(struct vbdev_wtcache *pt_node, struct pt_io_channel *pt_ch,
 }
 
 static void
+wtcache_fua_finish(struct spdk_bdev_io *orig_io, bool success)
+{
+	struct vbdev_wtcache *pt_node = SPDK_CONTAINEROF(orig_io->bdev, struct vbdev_wtcache, pt_bdev);
+
+	if (success) {
+		/* SSD에 들어간 데이터를 clean으로 캐시에 넣어 이후 읽기가 히트하게 */
+		wtc_insert_clean(pt_node->cache, orig_io->u.bdev.offset_blocks,
+				 orig_io->u.bdev.num_blocks,
+				 orig_io->u.bdev.iovs, orig_io->u.bdev.iovcnt);
+	}
+	spdk_bdev_io_complete(orig_io, success ? SPDK_BDEV_IO_STATUS_SUCCESS :
+			      SPDK_BDEV_IO_STATUS_FAILED);
+}
+
+static void
+wtcache_fua_flush_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	spdk_bdev_free_io(bdev_io);
+	wtcache_fua_finish(cb_arg, success);
+}
+
+static void
+wtcache_fua_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev_io *orig_io = cb_arg;
+	struct vbdev_wtcache *pt_node = SPDK_CONTAINEROF(orig_io->bdev, struct vbdev_wtcache, pt_bdev);
+	struct wtcache_bdev_io *io_ctx = (struct wtcache_bdev_io *)orig_io->driver_ctx;
+	struct pt_io_channel *pt_ch = spdk_io_channel_get_ctx(io_ctx->ch);
+	int rc;
+
+	spdk_bdev_free_io(bdev_io);
+	if (success && spdk_bdev_has_write_cache(pt_node->base_bdev)) {
+		/* SSD 자체에 휘발성 캐시가 있으면 SSD flush까지 끝나야 영속화 */
+		rc = spdk_bdev_flush_blocks(pt_node->base_desc, pt_ch->base_ch, 0,
+					    spdk_bdev_get_num_blocks(pt_node->base_bdev),
+					    wtcache_fua_flush_done, orig_io);
+		if (rc == 0) {
+			return;
+		}
+		success = false;
+	}
+	wtcache_fua_finish(orig_io, success);
+}
+
+static void
+wtcache_fua_write(struct vbdev_wtcache *pt_node, struct spdk_io_channel *ch,
+		  struct spdk_bdev_io *bdev_io)
+{
+	struct wtcache_bdev_io *io_ctx = (struct wtcache_bdev_io *)bdev_io->driver_ctx;
+	struct pt_io_channel *pt_ch = spdk_io_channel_get_ctx(ch);
+	uint64_t lba = bdev_io->u.bdev.offset_blocks;
+	uint64_t nblocks = bdev_io->u.bdev.num_blocks;
+	int rc;
+
+	io_ctx->ch = ch;
+
+	if (!wtc_range_dirty(pt_node->cache, lba, nblocks)) {
+		/* 빠른 경로: 겹치는 dirty가 없으니 캐시를 거치지 않고 바로 SSD로.
+		 * 끝나면 wtcache_fua_finish()에서 clean으로 캐시에 넣는다. */
+		rc = spdk_bdev_writev_blocks(pt_node->base_desc, pt_ch->base_ch,
+					     bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+					     lba, nblocks, wtcache_fua_write_done, bdev_io);
+		if (rc == -ENOMEM) {
+			vbdev_wtcache_queue_io(bdev_io);	/* 나중에 submit_request부터 다시 */
+		} else if (rc != 0) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
+		return;
+	}
+
+	/* 느린 경로: 옛 dirty와 겹친다. 바로 SSD에 쓰면 옛 데이터의 writeback이 나중에
+	 * 덮어쓸 수 있으므로, 캐시에 넣고 Flush처럼 앞의 쓰기가 다 내려갈 때까지 기다린다. */
+	rc = wtc_write(pt_node->cache, lba, nblocks, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt);
+	if (rc != 0) {
+		spdk_bdev_io_complete(bdev_io, rc == -ENOMEM ? SPDK_BDEV_IO_STATUS_NOMEM :
+				      SPDK_BDEV_IO_STATUS_FAILED);
+		wtcache_kick_writeback(pt_node);
+		return;
+	}
+	io_ctx->failed = false;
+	io_ctx->flush_mark = wtc_flush_mark(pt_node->cache);
+	if (pt_node->wb_thread == NULL ||
+	    spdk_thread_send_msg(pt_node->wb_thread, wtcache_wb_add_flush, io_ctx) != 0) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+	wtcache_kick_writeback(pt_node);
+}
+
+static void
 pt_init_ext_io_opts(struct spdk_bdev_io *bdev_io, struct spdk_bdev_ext_io_opts *opts)
 {
 	memset(opts, 0, sizeof(*opts));
@@ -675,10 +765,14 @@ vbdev_wtcache_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		/* [wtcache] 캐시에 넣고 바로 응답. 장치로는 writeback 스레드가 내린다 */
+		if (bdev_io->u.bdev.nvme_cdw12.raw & SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS) {
+			wtcache_fua_write(pt_node, ch, bdev_io);
+			return;
+		}
 		rc = wtc_write(pt_node->cache, bdev_io->u.bdev.offset_blocks,
 			       bdev_io->u.bdev.num_blocks,
 			       bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt);
-		if (rc == 0 && (bdev_io->u.bdev.nvme_cdw12.raw & SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)) {
+		/*if (rc == 0 && (bdev_io->u.bdev.nvme_cdw12.raw & SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS)) {
 			io_ctx->failed = false;
 			io_ctx->flush_mark = wtc_flush_mark(pt_node->cache);
 			if (pt_node->wb_thread == NULL ||
@@ -687,7 +781,7 @@ vbdev_wtcache_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 			}
 			wtcache_kick_writeback(pt_node);
 			return;
-		}
+		}*/
 		if (rc == 0) {
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 		} else if (rc == -ENOMEM) {
